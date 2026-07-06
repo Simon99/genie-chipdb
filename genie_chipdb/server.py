@@ -1,24 +1,39 @@
 from __future__ import annotations
 
-import json
 from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
 from pathlib import Path
 
 from .database import ChipDatabase
 
 
-def create_app(data_dir: str = "./chroma_data", lm_studio_url: str = "http://localhost:1234/v1") -> Flask:
+def create_app(data_dir: str = "./chroma_data",
+               lm_studio_url: str = "http://localhost:1234/v1",
+               ingest_root: str = None) -> Flask:
+    """Create the ChipDB Flask app.
+
+    ingest_root: directory whitelist for path-based ingest (/api/ingest with
+    type meeting/pdf). Paths resolving outside it are rejected with 403.
+    Defaults to the user's home directory.
+    """
     app = Flask(__name__, static_folder=None)
-    CORS(app)
 
     db = ChipDatabase(data_dir=data_dir, lm_studio_url=lm_studio_url)
+    root = Path(ingest_root).resolve() if ingest_root else Path.home().resolve()
 
     frontend_dir = Path(__file__).parent.parent / "frontend" / "dist"
 
+    def _check_ingest_path(raw_path):
+        """Return (resolved_path, error_response). Whitelist check against root."""
+        resolved = Path(raw_path).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None, (jsonify({"error": "path is outside the allowed ingest root"}), 403)
+        return resolved, None
+
     @app.route("/api/ask", methods=["POST"])
     def ask():
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         question = data.get("question", "")
         model = data.get("model", None)
         if not question:
@@ -28,24 +43,47 @@ def create_app(data_dir: str = "./chroma_data", lm_studio_url: str = "http://loc
 
     @app.route("/api/search", methods=["POST"])
     def search():
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         query = data.get("query", "")
-        n = data.get("n", 5)
         if not query:
             return jsonify({"error": "query is required"}), 400
+        try:
+            n = int(data.get("n", 5))
+        except (TypeError, ValueError):
+            return jsonify({"error": "n must be an integer"}), 400
+        n = max(1, min(n, 50))
         results = db.search(query, n_results=n)
         return jsonify({"results": results})
 
     @app.route("/api/ingest", methods=["POST"])
     def ingest():
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         source_type = data.get("type", "")
 
         if source_type == "meeting":
-            db.ingest_meeting_report(data["path"])
+            if not data.get("path"):
+                return jsonify({"error": "path is required for type=meeting"}), 400
+            path, err = _check_ingest_path(data["path"])
+            if err:
+                return err
+            db.ingest_meeting_report(str(path))
         elif source_type == "pdf":
-            db.ingest_pdf(data["path"], description=data.get("description", ""))
+            if not data.get("path"):
+                return jsonify({"error": "path is required for type=pdf"}), 400
+            path, err = _check_ingest_path(data["path"])
+            if err:
+                return err
+            result = db.ingest_pdf(str(path), description=data.get("description", ""))
+            return jsonify({
+                "status": "ok",
+                "pages": result["pages"],
+                "failed_pages": result["failed_pages"],
+                "chunks": result["chunks"],
+                "stats": db.stats(),
+            })
         elif source_type == "text":
+            if not data.get("text"):
+                return jsonify({"error": "text is required for type=text"}), 400
             db.ingest_text(data["text"], data.get("source", "manual"))
         else:
             return jsonify({"error": "type must be meeting, pdf, or text"}), 400
@@ -89,12 +127,22 @@ h1{color:#1a1a2e}
 async function doAsk(){
   const q=document.getElementById('q').value;
   if(!q)return;
-  document.getElementById('result').textContent='Thinking...';
+  const result=document.getElementById('result');
+  result.textContent='Thinking...';
   const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
   const d=await r.json();
-  let html=d.answer+'\\n\\n';
-  if(d.sources)d.sources.forEach(s=>{html+='<div class="source">Source: '+s.source_file+(s.page?' p.'+s.page:'')+'</div>';});
-  document.getElementById('result').innerHTML=html;
+  result.textContent='';
+  const answer=document.createElement('div');
+  answer.textContent=d.error?('Error: '+d.error):(d.answer||'');
+  result.appendChild(answer);
+  if(d.sources){
+    d.sources.forEach(s=>{
+      const el=document.createElement('div');
+      el.className='source';
+      el.textContent='Source: '+s.source_file+(s.page?' p.'+s.page:'');
+      result.appendChild(el);
+    });
+  }
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doAsk();});
 </script></body></html>"""

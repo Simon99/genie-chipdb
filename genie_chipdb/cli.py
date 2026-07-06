@@ -10,6 +10,7 @@ def main():
 
     # serve command
     serve = sub.add_parser("serve", help="Start web server")
+    serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=5100)
     serve.add_argument("--data-dir", default="./chroma_data")
     serve.add_argument("--url", default="http://localhost:1234/v1")
@@ -38,8 +39,8 @@ def main():
     if args.command == "serve":
         from .server import create_app
         app = create_app(data_dir=args.data_dir, lm_studio_url=args.url)
-        print("ChipDB server starting on http://localhost:%d" % args.port)
-        app.run(host="0.0.0.0", port=args.port, debug=False)
+        print("ChipDB server starting on http://%s:%d" % (args.host, args.port))
+        app.run(host=args.host, port=args.port, debug=False)
 
     elif args.command == "mcp":
         from .mcp_server import run_stdio
@@ -51,7 +52,11 @@ def main():
         if args.type == "meeting":
             db.ingest_meeting_report(args.path)
         elif args.type == "pdf":
-            db.ingest_pdf(args.path, description=args.description)
+            result = db.ingest_pdf(args.path, description=args.description)
+            if result["failed_pages"]:
+                print("WARNING: vision extraction failed for pages: %s" % (
+                    ", ".join(str(p) for p in result["failed_pages"])))
+            print("Pages: %d, chunks ingested: %d" % (result["pages"], result["chunks"]))
         elif args.type == "text":
             text = open(args.path, "r", encoding="utf-8").read()
             db.ingest_text(text, args.path)

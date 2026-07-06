@@ -14,10 +14,15 @@ from .database import ChipDatabase
 
 
 def handle_request(db: ChipDatabase, request: dict) -> dict:
-    """Handle a JSON-RPC style MCP request."""
+    """Handle a JSON-RPC style MCP request. Returns None for notifications."""
     method = request.get("method", "")
     params = request.get("params", {})
     req_id = request.get("id")
+
+    # Notifications (no id, method namespaced under notifications/) must not
+    # be answered per JSON-RPC / MCP spec.
+    if req_id is None and method.startswith("notifications/"):
+        return None
 
     if method == "initialize":
         return _response(req_id, {
@@ -35,7 +40,7 @@ def handle_request(db: ChipDatabase, request: dict) -> dict:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Search query about chip specs, features, test results"},
-                        "n": {"type": "integer", "description": "Number of results", "default": 5},
+                        "n": {"type": "integer", "description": "Number of results (1-50)", "default": 5},
                     },
                     "required": ["query"],
                 },
@@ -75,16 +80,30 @@ def handle_request(db: ChipDatabase, request: dict) -> dict:
         args = params.get("arguments", {})
 
         if tool_name == "chip_search":
-            results = db.search(args.get("query", ""), n_results=args.get("n", 5))
+            query = args.get("query", "")
+            if not isinstance(query, str) or not query.strip():
+                return _tool_error(req_id, "query must be a non-empty string")
+            try:
+                n = int(args.get("n", 5))
+            except (TypeError, ValueError):
+                return _tool_error(req_id, "n must be an integer")
+            n = max(1, min(n, 50))
+            results = db.search(query, n_results=n)
             return _response(req_id, {"content": [{"type": "text", "text": json.dumps(results, ensure_ascii=False, indent=2)}]})
 
         if tool_name == "chip_ask":
-            result = db.ask(args.get("question", ""))
+            question = args.get("question", "")
+            if not isinstance(question, str) or not question.strip():
+                return _tool_error(req_id, "question must be a non-empty string")
+            result = db.ask(question)
             return _response(req_id, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]})
 
         if tool_name == "chip_ingest":
-            db.ingest_text(args.get("text", ""), args.get("source", "mcp"))
-            return _response(req_id, {"content": [{"type": "text", "text": "Ingested successfully"}]})
+            text = args.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                return _tool_error(req_id, "text must be a non-empty string")
+            chunks = db.ingest_text(text, args.get("source", "mcp"))
+            return _response(req_id, {"content": [{"type": "text", "text": "Ingested successfully (%d chunks)" % chunks}]})
 
         if tool_name == "chip_stats":
             stats = db.stats()
@@ -103,6 +122,14 @@ def _error(req_id, code, message):
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+def _tool_error(req_id, message):
+    """MCP tool-level error: a successful JSON-RPC response flagged isError."""
+    return _response(req_id, {
+        "content": [{"type": "text", "text": message}],
+        "isError": True,
+    })
+
+
 def run_stdio(data_dir: str = "./chroma_data", lm_studio_url: str = "http://localhost:1234/v1"):
     """Run MCP server over stdin/stdout (standard MCP transport)."""
     db = ChipDatabase(data_dir=data_dir, lm_studio_url=lm_studio_url)
@@ -113,13 +140,28 @@ def run_stdio(data_dir: str = "./chroma_data", lm_studio_url: str = "http://loca
             continue
         try:
             request = json.loads(line)
-            response = handle_request(db, request)
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
         except json.JSONDecodeError:
-            err = _error(None, -32700, "Parse error")
-            sys.stdout.write(json.dumps(err) + "\n")
-            sys.stdout.flush()
+            _write(_error(None, -32700, "Parse error"))
+            continue
+
+        if not isinstance(request, dict):
+            _write(_error(None, -32600, "Invalid request: expected object"))
+            continue
+
+        try:
+            response = handle_request(db, request)
+        except Exception as e:
+            # Never let a tool exception (LM Studio down, bad args, ChromaDB IO,
+            # ...) kill the server loop.
+            response = _error(request.get("id"), -32603, str(e))
+
+        if response is not None:
+            _write(response)
+
+
+def _write(response: dict):
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
